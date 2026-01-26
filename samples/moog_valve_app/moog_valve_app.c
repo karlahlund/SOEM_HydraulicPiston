@@ -14,7 +14,7 @@
       If both ON -> treated as OFF (fault)
     - Potentiometer on EL3062 CH1 (assumed 0..10V)
     - Command output on EL4032 CH1: -10..+10V
-      Uses pot as magnitude:
+      Uses pot as magnitude and switch as direction:
         FWD -> +pot_volts
         REV -> -pot_volts
         OFF -> 0V
@@ -23,12 +23,15 @@
         FWD -> DO0=1 DO1=0
         REV -> DO0=0 DO1=1
         OFF/fault -> DO0=0 DO1=0
-    - Failsafe:
-        If WKC wrong or not OP -> outputs forced safe (0V, solenoids off) and recovery attempted.
+    - Safety:
+        * Slew-rate limiting (V/s) applied each cycle to analog command
+        * Direction flip neutral hold: when switching FWD<->REV, force neutral for N cycles,
+          then ramp toward new target.
+        * Failsafe on comms/state: solenoids OFF, command = 0V, ramp state reset, recovery attempted
 
   Headless:
     - No logging by default (stdout/stderr closed).
-    - Enable DEBUG_PRINT if you want diagnostics.
+    - Enable DEBUG_PRINT to keep prints.
 
   IMPORTANT NOTE about EL3062 PDO layout:
     Many Beckhoff analog input terminals map each channel as:
@@ -36,7 +39,12 @@
     This code assumes that layout:
       CH1 value = Istart + 2
       CH2 value = Istart + 6
-    If your EL3062 is mapped "value-only", change EL3062_CH1_VALUE_OFFSET to 0.
+    If your EL3062 is mapped "value-only", change EL3062_CH1_VALUE_OFFSET to 0
+    (and CH2 accordingly).
+
+  Build/run:
+    gcc -O2 -Wall -Wextra moog_valve_app.c -o moog_valve_app -lpthread   (plus SOEM objects if not building inside SOEM build system)
+    sudo ./moog_valve_app eth0
 */
 
 #include "soem/soem.h"
@@ -49,6 +57,12 @@
 
 /* Cycle time */
 #define CYCLE_USEC 100000   /* 100ms. Change to 10000 for 10ms, 50000 for 50ms, etc. */
+
+/* Slew-rate limiting (command volts per second) */
+#define SLEW_RATE_V_PER_SEC 5.0f     /* tune: 2..10 V/s typical for “operator knob + hydraulics” */
+
+/* Direction flip neutral hold (number of cycles to force command=0 and solenoids off after FWD<->REV flip) */
+#define DIR_FLIP_NEUTRAL_HOLD_CYCLES 5   /* at 100ms -> 500ms neutral; at 10ms -> 50ms neutral */
 
 /* DI assignments (EL1008) */
 #define DI_FWD_BIT 0
@@ -73,6 +87,16 @@ static inline int16_t v_to_raw_pm10(float v)             { v = clampf(v, -10.0f,
 #else
   #define DPRINTF(...) do { } while(0)
 #endif
+
+/* Slew limiter: constrain change per cycle based on dt and V/s */
+static float slew_limit(float target, float prev, float dt_sec, float slew_v_per_sec)
+{
+  float max_step = slew_v_per_sec * dt_sec;
+  float delta = target - prev;
+  if (delta >  max_step) delta =  max_step;
+  if (delta < -max_step) delta = -max_step;
+  return prev + delta;
+}
 
 /* ===================== Fieldbus wrapper ===================== */
 typedef struct {
@@ -113,7 +137,6 @@ static int fieldbus_expected_wkc(Fieldbus *fb)
 
 static boolean fieldbus_start(Fieldbus *fb)
 {
-  ec_groupt *grp = fb->ctx.grouplist + fb->group;
   ec_slavet *slave0 = fb->ctx.slavelist;
 
   DPRINTF("ecx_init(%s)\n", fb->iface);
@@ -232,6 +255,13 @@ static inline void outputs_safe(Fieldbus *fb, IOMap *io)
   *(int16_t *)(grp->outputs + io->ao_base + 0) = v_to_raw_pm10(0.0f);
 }
 
+/* ===================== Control state ===================== */
+typedef enum {
+  DIR_OFF = 0,
+  DIR_FWD = 1,
+  DIR_REV = 2
+} Direction;
+
 /* ===================== Main ===================== */
 int main(int argc, char *argv[])
 {
@@ -261,6 +291,13 @@ int main(int argc, char *argv[])
   ec_groupt *grp = fb.ctx.grouplist + fb.group;
   const int expected = fieldbus_expected_wkc(&fb);
 
+  /* Slew + direction flip safety state */
+  float cmd_prev = 0.0f;
+  const float dt_sec = (float)CYCLE_USEC / 1000000.0f;
+
+  Direction last_dir = DIR_OFF;
+  int neutral_hold = 0;
+
   for (;;)
   {
     int wkc = fieldbus_roundtrip(&fb);
@@ -272,6 +309,10 @@ int main(int argc, char *argv[])
 
     if (!ok) {
       outputs_safe(&fb, &io);
+      cmd_prev = 0.0f;
+      last_dir = DIR_OFF;
+      neutral_hold = 0;
+
       fieldbus_check_state(&fb);
       osal_usleep(CYCLE_USEC);
       continue;
@@ -283,29 +324,49 @@ int main(int argc, char *argv[])
     int rev = (di >> DI_REV_BIT) & 0x01;
 
     /* Invalid (both on) => OFF */
-    if (fwd && rev) { fwd = 0; rev = 0; }
+    Direction dir = DIR_OFF;
+    if (fwd && !rev) dir = DIR_FWD;
+    else if (rev && !fwd) dir = DIR_REV;
+    else dir = DIR_OFF;
 
     /* ---- READ AI: pot on EL3062 CH1 ---- */
     int16_t raw_pot = *(int16_t *)(grp->inputs + io.ai_base + EL3062_CH1_VALUE_OFFSET);
     float pot_v = clampf(raw_to_v_0_10(raw_pot), 0.0f, 10.0f);
 
-    /* ---- LOGIC ----
-       Pot controls magnitude, switch controls direction.
-       OFF => 0V command.
+    /* ---- Direction flip neutral hold ----
+       If last_dir and dir are opposite (FWD<->REV), enforce neutral for N cycles.
+       Also drop solenoids during the neutral window.
     */
-    float cmd_v = 0.0f;
-    int sol_fwd = 0, sol_rev = 0;
-
-    if (fwd) {
-      sol_fwd = 1; sol_rev = 0;
-      cmd_v = +pot_v;          /* 0..+10V */
-    } else if (rev) {
-      sol_fwd = 0; sol_rev = 1;
-      cmd_v = -pot_v;          /* 0..-10V */
-    } else {
-      sol_fwd = 0; sol_rev = 0;
-      cmd_v = 0.0f;
+    if ((last_dir == DIR_FWD && dir == DIR_REV) || (last_dir == DIR_REV && dir == DIR_FWD)) {
+      neutral_hold = DIR_FLIP_NEUTRAL_HOLD_CYCLES;
     }
+    last_dir = dir;
+
+    int sol_fwd = 0, sol_rev = 0;
+    float target_cmd_v = 0.0f;
+
+    if (neutral_hold > 0) {
+      neutral_hold--;
+      sol_fwd = 0;
+      sol_rev = 0;
+      target_cmd_v = 0.0f;
+      /* Reset ramp toward zero cleanly during neutral window */
+    } else {
+      if (dir == DIR_FWD) {
+        sol_fwd = 1; sol_rev = 0;
+        target_cmd_v = +pot_v;    /* 0..+10V */
+      } else if (dir == DIR_REV) {
+        sol_fwd = 0; sol_rev = 1;
+        target_cmd_v = -pot_v;    /* 0..-10V */
+      } else {
+        sol_fwd = 0; sol_rev = 0;
+        target_cmd_v = 0.0f;
+      }
+    }
+
+    /* ---- Slew-limit analog command every cycle ---- */
+    float cmd_v = slew_limit(target_cmd_v, cmd_prev, dt_sec, SLEW_RATE_V_PER_SEC);
+    cmd_prev = cmd_v;
 
     /* ---- WRITE DO: solenoids ---- */
     uint8_t out = grp->outputs[io.do_base];
