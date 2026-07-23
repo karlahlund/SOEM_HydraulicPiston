@@ -1,20 +1,16 @@
 /*
-  moog_valve_app.c  (single-file SOEM app, fixed slave order)
+  moog2.c  (single-file SOEM 2.x app, fixed slave order)
 
   Physical order (fixed):
     1 EK1100
     2 EL1008  (DI)
     3 EL2008  (DO)
-    4 EL3062  (AI)
+    4 EL3062  (AI, 0..10V confirmed)
     5 EL4032  (AO +/-10V)
 
   Modes:
     sudo ./moog_valve_app eth0             -> normal control loop
     sudo ./moog_valve_app eth0 --monitor   -> bench monitor, manual outputs only
-
-  Build:
-    gcc -O2 -Wall -Wextra moog_valve_app.c -o moog_valve_app -lpthread \
-        (plus SOEM objects/lib if not building inside the SOEM build system)
 */
 
 #include "soem/soem.h"
@@ -40,17 +36,15 @@
 #define DO_SOL_FWD_BIT 0
 #define DO_SOL_REV_BIT 1
 
-/* EL3062 value offsets (within its input area).
+/* EL3062 value offsets within its own input area.
    Default assumes status(2)+value(2) per channel.
-   If your terminal is mapped value-only, use 0 and 2. */
+   If mapped value-only, use 0 and 2. */
 #define EL3062_CH1_VALUE_OFFSET     2
 #define EL3062_CH2_VALUE_OFFSET     6
 
 #define EXPECTED_SLAVE_COUNT 5
 
 /* ===================== Printing ===================== */
-/* Errors always go to stderr so init failures are diagnosable.
-   Headless redirection happens only after init succeeds. */
 #define EPRINTF(...) do { fprintf(stderr, __VA_ARGS__); fflush(stderr); } while(0)
 
 #if DEBUG_PRINT
@@ -60,9 +54,25 @@
 #endif
 
 /* ===================== Scaling helpers ===================== */
-static inline float clampf(float v, float lo, float hi) { return (v < lo) ? lo : (v > hi) ? hi : v; }
-static inline float raw_to_v_0_10(int16_t raw)           { return ((float)raw) * 10.0f / 32767.0f; }
-static inline int16_t v_to_raw_pm10(float v)             { v = clampf(v, -10.0f, 10.0f); return (int16_t)(v * 32767.0f / 10.0f); }
+static inline float clampf(float v, float lo, float hi)
+{
+  return (v < lo) ? lo : (v > hi) ? hi : v;
+}
+
+/* EL3062 confirmed 0..10V: 32767 -> 10.000V.
+   Negative raw on a unipolar terminal indicates wiring/config fault. */
+static inline float raw_to_v_0_10(int16_t raw)
+{
+  if (raw < 0) raw = 0;
+  return ((float)raw) * 10.0f / 32767.0f;
+}
+
+/* EL4032 is bipolar: command carries direction for the servo valve. */
+static inline int16_t v_to_raw_pm10(float v)
+{
+  v = clampf(v, -10.0f, 10.0f);
+  return (int16_t)(v * 32767.0f / 10.0f);
+}
 
 static float slew_limit(float target, float prev, float dt_sec, float slew_v_per_sec)
 {
@@ -110,8 +120,8 @@ static int fieldbus_expected_wkc(Fieldbus *fb)
   return grp->outputsWKC * 2 + grp->inputsWKC;
 }
 
-/* Expected identities. eep_id values are the common Beckhoff product codes;
-   verify against your own slaveinfo output and correct if they differ. */
+/* Expected identities. Verify these against your slaveinfo output;
+   mismatches only produce warnings, not failures. */
 static const struct { uint32_t pid; const char *name; } expected_slaves[EXPECTED_SLAVE_COUNT] = {
   { 0x044c2c52, "EK1100" },
   { 0x03f03052, "EL1008" },
@@ -128,7 +138,7 @@ static void dump_bad_states(Fieldbus *fb, uint16_t want)
     if (s->state != want) {
       EPRINTF("  slave %d %-10s state=0x%02x AL=0x%04x : %s\n",
               i, s->name, s->state, s->ALstatuscode,
-              ecx_ALstatuscode2string(s->ALstatuscode));
+              ec_ALstatuscode2string(s->ALstatuscode));
     }
   }
 }
@@ -144,7 +154,6 @@ static boolean fieldbus_start(Fieldbus *fb)
     return FALSE;
   }
 
-  /* slavelist is only meaningful after init */
   slave0 = fb->ctx.slavelist;
 
   if (ecx_config_init(&fb->ctx) <= 0) {
@@ -164,7 +173,7 @@ static boolean fieldbus_start(Fieldbus *fb)
     EPRINTF("  %d: %-12s man=0x%08x id=0x%08x rev=0x%08x\n",
             i, s->name, s->eep_man, s->eep_id, s->eep_rev);
     if (s->eep_id != expected_slaves[i-1].pid) {
-      EPRINTF("     WARN: expected %s (0x%08x), got 0x%08x - fixed offsets may be wrong\n",
+      EPRINTF("     WARN: expected %s (0x%08x), got 0x%08x - fixed mapping may be wrong\n",
               expected_slaves[i-1].name, expected_slaves[i-1].pid, s->eep_id);
     }
   }
@@ -186,8 +195,8 @@ static boolean fieldbus_start(Fieldbus *fb)
     return FALSE;
   }
 
-  /* Send valid process data before requesting OP, otherwise the sync
-     manager watchdog trips and slaves fall back to SAFE_OP + ERROR */
+  /* Valid process data before requesting OP, or the SM watchdog trips
+     and slaves fall back to SAFE_OP + ERROR */
   for (i = 0; i < 4; ++i) {
     ecx_send_processdata(&fb->ctx);
     ecx_receive_processdata(&fb->ctx, EC_TIMEOUTRET);
@@ -261,17 +270,22 @@ static void fieldbus_check_state(Fieldbus *fb)
   }
 }
 
-/* ===================== Fixed IO mapping ===================== */
+/* ===================== Fixed IO mapping (pointer-based) ===================== */
 typedef struct {
   int s_ek1100, s_el1008, s_el2008, s_el3062, s_el4032;
-  int di_base;
-  int do_base;
-  int ai_base;
-  int ao_base;
+
+  uint8_t *di;    /* EL1008 inputs  */
+  uint8_t *dout;  /* EL2008 outputs */
+  uint8_t *ai;    /* EL3062 inputs  */
+  uint8_t *ao;    /* EL4032 outputs */
+
+  uint32_t di_bytes, do_bytes, ai_bytes, ao_bytes;
 } IOMap;
 
 static int iomap_bind_fixed(IOMap *io, Fieldbus *fb)
 {
+  ec_slavet *sl = fb->ctx.slavelist;
+
   memset(io, 0, sizeof(*io));
 
   io->s_ek1100 = 1;
@@ -282,23 +296,42 @@ static int iomap_bind_fixed(IOMap *io, Fieldbus *fb)
 
   if (fb->ctx.slavecount < EXPECTED_SLAVE_COUNT) return 0;
 
-  io->di_base = (fb->ctx.slavelist + io->s_el1008)->Istart;
-  io->do_base = (fb->ctx.slavelist + io->s_el2008)->Ostart;
-  io->ai_base = (fb->ctx.slavelist + io->s_el3062)->Istart;
-  io->ao_base = (fb->ctx.slavelist + io->s_el4032)->Ostart;
+  io->di   = sl[io->s_el1008].inputs;
+  io->dout = sl[io->s_el2008].outputs;
+  io->ai   = sl[io->s_el3062].inputs;
+  io->ao   = sl[io->s_el4032].outputs;
+
+  io->di_bytes = sl[io->s_el1008].Ibytes;
+  io->do_bytes = sl[io->s_el2008].Obytes;
+  io->ai_bytes = sl[io->s_el3062].Ibytes;
+  io->ao_bytes = sl[io->s_el4032].Obytes;
+
+  if (!io->di || !io->dout || !io->ai || !io->ao) {
+    EPRINTF("FAIL: null IO pointer (di=%p do=%p ai=%p ao=%p)\n",
+            (void *)io->di, (void *)io->dout, (void *)io->ai, (void *)io->ao);
+    return 0;
+  }
+
+  /* EL3062 needs 8 bytes for status+value on two channels;
+     EL4032 needs 4 for two 16-bit outputs. Guard the casts below. */
+  if (io->ai_bytes < (uint32_t)(EL3062_CH2_VALUE_OFFSET + 2)) {
+    EPRINTF("FAIL: EL3062 input area %u bytes, need >= %d. "
+            "Terminal likely mapped value-only - set EL3062_CH*_VALUE_OFFSET to 0/2.\n",
+            io->ai_bytes, EL3062_CH2_VALUE_OFFSET + 2);
+    return 0;
+  }
+  if (io->ao_bytes < 2) {
+    EPRINTF("FAIL: EL4032 output area %u bytes, need >= 2\n", io->ao_bytes);
+    return 0;
+  }
 
   return 1;
 }
 
-static inline void outputs_safe(Fieldbus *fb, IOMap *io)
+static inline void outputs_safe(IOMap *io)
 {
-  ec_groupt *grp = fb->ctx.grouplist + fb->group;
-
-  uint8_t out = grp->outputs[io->do_base];
-  out &= (uint8_t)~((1u << DO_SOL_FWD_BIT) | (1u << DO_SOL_REV_BIT));
-  grp->outputs[io->do_base] = out;
-
-  *(int16_t *)(grp->outputs + io->ao_base + 0) = v_to_raw_pm10(0.0f);
+  io->dout[0] &= (uint8_t)~((1u << DO_SOL_FWD_BIT) | (1u << DO_SOL_REV_BIT));
+  *(int16_t *)(io->ao + 0) = v_to_raw_pm10(0.0f);
 }
 
 /* ===================== Monitor / bench mode ===================== */
@@ -307,15 +340,18 @@ static void print_slave_states(Fieldbus *fb)
   ecx_readstate(&fb->ctx);
   for (int i = 1; i <= fb->ctx.slavecount; ++i) {
     ec_slavet *s = fb->ctx.slavelist + i;
-    printf("  %d %-10s state=0x%02x AL=0x%04x Ibits=%3d Obits=%3d Istart=%d Ostart=%d\n",
+    long ioff = s->inputs  ? (long)(s->inputs  - fb->iomap) : -1;
+    long ooff = s->outputs ? (long)(s->outputs - fb->iomap) : -1;
+    printf("  %d %-10s state=0x%02x AL=0x%04x  Ibits=%3u Ibytes=%2u @%4ld  "
+           "Obits=%3u Obytes=%2u @%4ld\n",
            i, s->name, s->state, s->ALstatuscode,
-           s->Ibits, s->Obits, s->Istart, s->Ostart);
+           s->Ibits, s->Ibytes, ioff,
+           s->Obits, s->Obytes, ooff);
   }
 }
 
 static void monitor_loop(Fieldbus *fb, IOMap *io)
 {
-  ec_groupt *grp = fb->ctx.grouplist + fb->group;
   const int expected = fieldbus_expected_wkc(fb);
   uint8_t manual_do = 0;
   float   manual_ao = 0.0f;
@@ -330,7 +366,7 @@ static void monitor_loop(Fieldbus *fb, IOMap *io)
 
   tcgetattr(STDIN_FILENO, &oldt);
   newt = oldt;
-  newt.c_lflag &= (unsigned)~(ICANON | ECHO);
+  newt.c_lflag &= (tcflag_t)~(ICANON | ECHO);
   tcsetattr(STDIN_FILENO, TCSANOW, &newt);
   oldfl = fcntl(STDIN_FILENO, F_GETFL, 0);
   fcntl(STDIN_FILENO, F_SETFL, oldfl | O_NONBLOCK);
@@ -347,14 +383,14 @@ static void monitor_loop(Fieldbus *fb, IOMap *io)
     else if (c == '-') manual_ao = clampf(manual_ao - 0.5f, -10.0f, 10.0f);
     else if (c == 'z') manual_ao = 0.0f;
 
-    grp->outputs[io->do_base] = manual_do;
-    *(int16_t *)(grp->outputs + io->ao_base + 0) = v_to_raw_pm10(manual_ao);
+    io->dout[0] = manual_do;
+    *(int16_t *)(io->ao + 0) = v_to_raw_pm10(manual_ao);
 
-    uint8_t  di      = grp->inputs[io->di_base];
-    int16_t  ai1_raw = *(int16_t *)(grp->inputs + io->ai_base + EL3062_CH1_VALUE_OFFSET);
-    int16_t  ai2_raw = *(int16_t *)(grp->inputs + io->ai_base + EL3062_CH2_VALUE_OFFSET);
-    uint16_t ai1_sts = *(uint16_t *)(grp->inputs + io->ai_base + 0);
-    uint16_t ai2_sts = *(uint16_t *)(grp->inputs + io->ai_base + 4);
+    uint8_t  di      = io->di[0];
+    int16_t  ai1_raw = *(int16_t *)(io->ai + EL3062_CH1_VALUE_OFFSET);
+    int16_t  ai2_raw = *(int16_t *)(io->ai + EL3062_CH2_VALUE_OFFSET);
+    uint16_t ai1_sts = *(uint16_t *)(io->ai + 0);
+    uint16_t ai2_sts = *(uint16_t *)(io->ai + 4);
 
     if ((cycle++ % 5) == 0) {
       int f = (di >> DI_FWD_BIT) & 1;
@@ -393,8 +429,8 @@ static void monitor_loop(Fieldbus *fb, IOMap *io)
     osal_usleep(CYCLE_USEC);
   }
 
-  grp->outputs[io->do_base] = 0;
-  *(int16_t *)(grp->outputs + io->ao_base + 0) = 0;
+  io->dout[0] = 0;
+  *(int16_t *)(io->ao + 0) = 0;
   fieldbus_roundtrip(fb);
 
   fcntl(STDIN_FILENO, F_SETFL, oldfl);
@@ -435,8 +471,11 @@ int main(int argc, char *argv[])
     return 1;
   }
 
-  EPRINTF("Offsets: DI=%d DO=%d AI=%d AO=%d\n",
-          io.di_base, io.do_base, io.ai_base, io.ao_base);
+  EPRINTF("IO bound: DI@%ld(%u B)  DO@%ld(%u B)  AI@%ld(%u B)  AO@%ld(%u B)\n",
+          (long)(io.di - fb.iomap),   io.di_bytes,
+          (long)(io.dout - fb.iomap), io.do_bytes,
+          (long)(io.ai - fb.iomap),   io.ai_bytes,
+          (long)(io.ao - fb.iomap),   io.ao_bytes);
 
   if (monitor) {
     monitor_loop(&fb, &io);
@@ -450,7 +489,6 @@ int main(int argc, char *argv[])
     if (!freopen("/dev/null", "w", stderr)) { /* ignore */ }
   }
 
-  ec_groupt *grp = fb.ctx.grouplist + fb.group;
   const int expected = fieldbus_expected_wkc(&fb);
 
   float cmd_prev = 0.0f;
@@ -468,7 +506,7 @@ int main(int argc, char *argv[])
     if (fb.ctx.slavelist[0].state != EC_STATE_OPERATIONAL) ok = 0;
 
     if (!ok) {
-      outputs_safe(&fb, &io);
+      outputs_safe(&io);
       cmd_prev = 0.0f;
       last_dir = DIR_OFF;
       neutral_hold = 0;
@@ -479,7 +517,7 @@ int main(int argc, char *argv[])
     }
 
     /* ---- READ DI: switch ---- */
-    uint8_t di = grp->inputs[io.di_base];
+    uint8_t di = io.di[0];
     int fwd = (di >> DI_FWD_BIT) & 0x01;
     int rev = (di >> DI_REV_BIT) & 0x01;
 
@@ -487,8 +525,8 @@ int main(int argc, char *argv[])
     if (fwd && !rev) dir = DIR_FWD;
     else if (rev && !fwd) dir = DIR_REV;
 
-    /* ---- READ AI: pot on EL3062 CH1 ---- */
-    int16_t raw_pot = *(int16_t *)(grp->inputs + io.ai_base + EL3062_CH1_VALUE_OFFSET);
+    /* ---- READ AI: pot on EL3062 CH1 (0..10V) ---- */
+    int16_t raw_pot = *(int16_t *)(io.ai + EL3062_CH1_VALUE_OFFSET);
     float pot_v = clampf(raw_to_v_0_10(raw_pot), 0.0f, 10.0f);
 
     /* ---- Direction flip neutral hold ---- */
@@ -517,14 +555,14 @@ int main(int argc, char *argv[])
     cmd_prev = cmd_v;
 
     /* ---- WRITE DO: solenoids ---- */
-    uint8_t out = grp->outputs[io.do_base];
+    uint8_t out = io.dout[0];
     out &= (uint8_t)~((1u << DO_SOL_FWD_BIT) | (1u << DO_SOL_REV_BIT));
-    if (sol_fwd) out |= (1u << DO_SOL_FWD_BIT);
-    if (sol_rev) out |= (1u << DO_SOL_REV_BIT);
-    grp->outputs[io.do_base] = out;
+    if (sol_fwd) out |= (uint8_t)(1u << DO_SOL_FWD_BIT);
+    if (sol_rev) out |= (uint8_t)(1u << DO_SOL_REV_BIT);
+    io.dout[0] = out;
 
     /* ---- WRITE AO: EL4032 CH1 ---- */
-    *(int16_t *)(grp->outputs + io.ao_base + 0) = v_to_raw_pm10(cmd_v);
+    *(int16_t *)(io.ao + 0) = v_to_raw_pm10(cmd_v);
 
     osal_usleep(CYCLE_USEC);
   }
