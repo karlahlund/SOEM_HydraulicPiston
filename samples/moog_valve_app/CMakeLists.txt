@@ -18,8 +18,10 @@ add_executable(moog_valve_app
 target_include_directories(moog_valve_app PRIVATE
   "${SOEM_ROOT}/include"
   "${SOEM_ROOT}/build/include"
+  "${SOEM_ROOT}/osal"
+  "${SOEM_ROOT}/osal/linux"
+  "${SOEM_ROOT}/oshw/linux"
 )
-
 # ---- SOEM library ----
 # SOEM 2.x is already built as a static library; link it rather than
 # recompiling its sources. There are no top-level osal/ or oshw/ dirs
